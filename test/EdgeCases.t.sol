@@ -10,6 +10,11 @@ import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {NightshiftHook} from "../src/NightshiftHook.sol";
 import {FeeSplitter} from "../src/FeeSplitter.sol";
@@ -218,6 +223,8 @@ contract ShiftRewardsEdgeTest is Test {
         rewards.claimFrogs(2, ETH, 1 ether, proof);
     }
 
+    event RewardPaymentFailed(address indexed account, address indexed token, uint256 amount);
+
     function test_ethRefusingStakerKeepsStakeAndOtherRewards() public {
         EthRefuser r = new EthRefuser(rewards, shift);
         shift.transfer(address(r), 100e18);
@@ -227,24 +234,59 @@ contract ShiftRewardsEdgeTest is Test {
         vm.prank(distributor);
         rewards.notifyReceived(address(shift));
         vm.warp(block.timestamp + 7 days);
-        // ETH payout reverts, but SHIFT rewards and the stake are still reachable.
-        vm.expectRevert(ShiftRewards.EthTransferFailed.selector);
+        uint256 ethOwed = rewards.earned(address(r), ETH);
+        assertApproxEqAbs(ethOwed, 1 ether, 1e6);
+        // The batch skips the ETH payout it cannot make and still pays SHIFT.
+        vm.expectEmit(true, true, false, true, address(rewards));
+        emit RewardPaymentFailed(address(r), ETH, ethOwed);
         r.getReward();
-        r.getReward(address(shift));
         assertApproxEqAbs(shift.balanceOf(address(r)), 1e18, 1e6);
+        assertEq(rewards.earned(address(r), ETH), ethOwed, "ETH reward still owed, not lost");
+        assertEq(rewards.accounted(ETH), address(rewards).balance, "owed ETH still accounted");
+        // Asking for ETH alone reverts and changes nothing.
+        vm.expectRevert(ShiftRewards.EthTransferFailed.selector);
+        r.getReward(ETH);
+        assertEq(rewards.earned(address(r), ETH), ethOwed);
         r.withdraw(100e18);
         assertApproxEqAbs(shift.balanceOf(address(r)), 101e18, 1e6);
-        assertGt(rewards.earned(address(r), ETH), 0, "ETH reward still owed, not lost");
     }
 
-    function test_streamWithNoStakersIsNotPaidToLateStaker() public {
+    function test_streamWithNoStakersIsPaidToNextStakers() public {
         _fundEth(2 ether);
         vm.warp(block.timestamp + 7 days);
+        // Nobody was staked: nothing streamed to nobody, the clock waited.
         vm.prank(alice);
         rewards.stake(1e18, 0);
-        vm.warp(block.timestamp + 7 days);
-        assertEq(rewards.earned(alice, ETH), 0, "the elapsed stream is not back-paid");
+        assertEq(rewards.earned(alice, ETH), 0, "nothing earned before time passes");
+        vm.warp(block.timestamp + 3.5 days);
+        assertApproxEqRel(rewards.earned(alice, ETH), 0.5 ether, 1e9, "stream resumed, not back-paid at once");
+        vm.warp(block.timestamp + 3.5 days);
+        assertApproxEqAbs(rewards.earned(alice, ETH), 1 ether, 1e6, "whole staker half reaches the late staker");
+        vm.warp(block.timestamp + 30 days);
+        assertApproxEqAbs(rewards.earned(alice, ETH), 1 ether, 1e6, "never more than streamed");
         assertEq(address(rewards).balance, 2 ether, "nothing left the contract");
+    }
+
+    /// forge-config: default.fuzz.runs = 300
+    function testFuzz_gapWithNoStakersPausesStream(uint256 before_, uint256 gap) public {
+        before_ = bound(before_, 1 hours, 7 days - 1 hours);
+        gap = bound(gap, 1, 60 days);
+        vm.prank(alice);
+        rewards.stake(100e18, 0);
+        _fundEth(14 ether); // 7 ETH to stakers over 7 days
+        vm.warp(block.timestamp + before_);
+        vm.prank(alice);
+        rewards.withdraw(100e18);
+        uint256 aliceEarned = rewards.earned(alice, ETH);
+        vm.warp(block.timestamp + gap);
+        assertEq(rewards.earned(alice, ETH), aliceEarned, "unstaked account keeps earning");
+        vm.prank(bob);
+        rewards.stake(50e18, 0);
+        vm.warp(block.timestamp + 7 days);
+        uint256 bobEarned = rewards.earned(bob, ETH);
+        assertLe(aliceEarned + bobEarned, 7 ether, "paid more than streamed");
+        assertApproxEqAbs(aliceEarned + bobEarned, 7 ether, 1e9, "part of the stream stranded by the gap");
+        assertApproxEqAbs(aliceEarned, 7 ether * before_ / 7 days, 1e9);
     }
 
     /// forge-config: default.fuzz.runs = 500
@@ -286,6 +328,50 @@ contract ShiftRewardsEdgeTest is Test {
         assertApproxEqAbs(ea, expectA, 1e9);
         assertApproxEqAbs(eb, (rate * (7 days - t1) / 2) / 1e18, 1e9);
         assertGt(ea, eb, "earlier staker earned less");
+    }
+}
+
+/// @notice A router that swaps with a caller-chosen price limit, so a swap can stop before it is filled.
+contract LimitSwapper is IUnlockCallback {
+    IPoolManager immutable manager;
+
+    constructor(IPoolManager manager_) {
+        manager = manager_;
+    }
+
+    receive() external payable {}
+
+    function swap(PoolKey memory key, bool zeroForOne, int256 amountSpecified, uint160 limit)
+        external
+        returns (BalanceDelta)
+    {
+        SwapParams memory params =
+            SwapParams({zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: limit});
+        return abi.decode(manager.unlock(abi.encode(key, params)), (BalanceDelta));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "not manager");
+        (PoolKey memory key, SwapParams memory params) = abi.decode(data, (PoolKey, SwapParams));
+        BalanceDelta d = manager.swap(key, params, "");
+        _settle(key.currency0, d.amount0());
+        _settle(key.currency1, d.amount1());
+        return abi.encode(d);
+    }
+
+    function _settle(Currency c, int128 amount) internal {
+        if (amount > 0) {
+            manager.take(c, address(this), uint128(amount));
+        } else if (amount < 0) {
+            uint256 owed = uint128(-amount);
+            if (c.isAddressZero()) {
+                manager.settle{value: owed}();
+            } else {
+                manager.sync(c);
+                IERC20(Currency.unwrap(c)).transfer(address(manager), owed);
+                manager.settle();
+            }
+        }
     }
 }
 
@@ -426,6 +512,74 @@ contract LaunchEdgeTest is Test {
         assertLe(shift.balanceOf(address(splitter)), uint256(uint128(-d.amount1())) * 250 / 10_000);
     }
 
+    function _wrappedAfter(bytes4 inner) internal view returns (bytes memory) {
+        return abi.encodeWithSelector(
+            CustomRevert.WrappedError.selector,
+            address(hook),
+            IHooks.afterSwap.selector,
+            abi.encodeWithSelector(inner),
+            abi.encodeWithSelector(Hooks_HookCallFailed)
+        );
+    }
+
+    function _limitSwapper() internal returns (LimitSwapper ls, uint160 sqrtPrice) {
+        vm.prank(FIRST_BUYER, FIRST_BUYER);
+        router.swapExact(key, true, -1 ether);
+        ls = new LimitSwapper(IPoolManager(address(manager)));
+        shift.transfer(address(ls), 10_000_000e18);
+        vm.deal(address(ls), 10_000 ether);
+        (sqrtPrice,,,) = StateLibrary.getSlot0(IPoolManager(address(manager)), PoolIdLibrary.toId(key));
+    }
+
+    function test_sellStoppedByPriceLimitRevertsPartialFill() public {
+        (LimitSwapper ls, uint160 p) = _limitSwapper();
+        // A sell pushes the price up (SHIFT in). A limit 0.1% above the price stops a large sell early.
+        uint160 limit = p + p / 1000;
+        vm.prank(alice, alice);
+        vm.expectRevert(_wrappedAfter(NightshiftHook.PartialFill.selector));
+        ls.swap(key, false, -5000e18, limit);
+        vm.prank(alice, alice);
+        vm.expectRevert(_wrappedAfter(NightshiftHook.PartialFill.selector));
+        ls.swap(key, false, int256(1000 ether), limit);
+        assertEq(shift.balanceOf(address(splitter)), 0, "no fee kept from a refused sell");
+        // Control: a sell that fits under the same limit goes through and pays both fee parts.
+        vm.prank(alice, alice);
+        ls.swap(key, false, -1e18, limit);
+        assertEq(shift.balanceOf(address(splitter)), 1e18 * 250 / 10_000);
+        assertGt(address(splitter).balance + hook.pendingEthClaims(), 0);
+    }
+
+    function test_buyStoppedByPriceLimitIsAllowedWithoutFee() public {
+        (LimitSwapper ls, uint160 p) = _limitSwapper();
+        uint160 limit = p - p / 20_000;
+        vm.prank(alice, alice);
+        BalanceDelta d = ls.swap(key, true, -1000 ether, limit);
+        assertLt(uint256(uint128(-d.amount0())), 1000 ether, "buy was partial");
+        assertEq(shift.balanceOf(address(splitter)), 0);
+        assertEq(address(splitter).balance, 0);
+    }
+
+    function test_hookedRoutesRefused() public {
+        vm.prank(OWNER);
+        splitter.setKeeper(keeper);
+        vm.startPrank(keeper);
+        vm.expectRevert(FeeSplitter.BadRoute.selector);
+        splitter.setImdPool(PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 3000, 60, IHooks(address(hook))));
+        MockERC20 other = new MockERC20("O", "O", 0);
+        vm.expectRevert(FeeSplitter.BadRoute.selector);
+        splitter.setEthPool(
+            address(other),
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(other)), 3000, 60, IHooks(address(1)))
+        );
+        // The same routes without a hook are accepted.
+        splitter.setImdPool(PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 3000, 60, IHooks(address(0))));
+        splitter.setEthPool(
+            address(other),
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(other)), 3000, 60, IHooks(address(0)))
+        );
+        vm.stopPrank();
+    }
+
     function test_burnReserveFailurePathsKeepReserve() public {
         vm.deal(address(splitter), 10 ether);
         splitter.distribute(address(0));
@@ -433,10 +587,14 @@ contract LaunchEdgeTest is Test {
         splitter.setKeeper(keeper);
         vm.prank(keeper);
         vm.expectRevert(FeeSplitter.ZeroAmount.selector);
-        splitter.burnReserve(address(0), 0, 0);
+        splitter.burnReserve(address(0), 0, 1);
+        // No unbounded burns: a zero minimum is refused.
+        vm.prank(keeper);
+        vm.expectRevert(FeeSplitter.ZeroAmount.selector);
+        splitter.burnReserve(address(0), 1 ether, 0);
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(FeeSplitter.RouteNotConfigured.selector, address(0)));
-        splitter.burnReserve(address(0), 1 ether, 0);
+        splitter.burnReserve(address(0), 1 ether, 1);
 
         vm.etch(IMD, address(new MockERC20("IMD", "IMD", 0)).code);
         PoolKey memory imdKey = PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 3000, 60, IHooks(address(0)));
@@ -448,7 +606,7 @@ contract LaunchEdgeTest is Test {
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(FeeSplitter.ExceedsReserve.selector, 2 ether + 1, 2 ether));
-        splitter.burnReserve(address(0), 2 ether + 1, 0);
+        splitter.burnReserve(address(0), 2 ether + 1, 1);
         vm.prank(keeper);
         vm.expectRevert(); // InsufficientImdOut
         splitter.burnReserve(address(0), 1 ether, 1 ether);
@@ -457,7 +615,7 @@ contract LaunchEdgeTest is Test {
         // The owner itself is not the keeper.
         vm.prank(OWNER);
         vm.expectRevert(FeeSplitter.NotKeeper.selector);
-        splitter.burnReserve(address(0), 1 ether, 0);
+        splitter.burnReserve(address(0), 1 ether, 1);
         // Non-owner cannot set the keeper.
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
