@@ -1,0 +1,32 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "NightshiftHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token",
+      "$owner",
+      "$factory"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "ShiftToken",
+    "name": "NIGHTSHIFT",
+    "symbol": "SHIFT",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "NightshiftHook serves the SHIFT/native ETH pool. Its constructor creates ShiftRewards and FeeSplitter, wires the splitter as the rewards distributor, and assigns all three Ownable roles to $owner, resolving to the dev wallet 0x6c4c78f2c3bdf4c4318fe305fb1c8bc1694d19b5. Helpers are available through rewards() and feeSplitter(); they need no separate deployment arguments. ShiftToken has no constructor arguments and is a plain 18-decimal ERC-20 with no post-deployment mint, transfer fee, blocklist or pause. The hook address must encode permissions 0x20cc (8396). Enabled callbacks accept only PoolManager. beforeInitialize accepts only $factory, once, for native ETH as currency0 and $token as currency1, with a static fee including 12500. There are no liquidity callbacks. Until tradingOpen, swaps require tx.origin 0x3322e6dd06ade8377f1f1bcb766f6133d7b64d69; its first buy-direction swap opens trading permanently and emits TradingOpened. No buy-size bounds or hook buy fees are imposed. Sells start at 250 bps of SHIFT input and 250 bps of ETH output, above the pool LP fee, with FeeTaken identifying tx.origin. Exact-input sells deduct the SHIFT fee before swapping and the ETH fee from output; exact-output sells gross up ETH output and add the SHIFT fee to pool input. setFees lets the owner select each rate from 0 to 250 bps. SHIFT fees go directly to FeeSplitter. ETH fees go directly when PoolManager is funded; otherwise ERC-6909 claims remain at the hook until anyone calls redeemFeeClaims(). FeeSplitter.distribute(token) is permissionless: 40% to ShiftRewards, 20% to the fixed dev wallet, 20% to treasury 0x3322e6dd06ade8377f1f1bcb766f6133d7b64d69 and 20% burned, with rounding dust to rewards. SHIFT burns to 0x000000000000000000000000000000000000dead; IMD 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7 goes to BurnExecutor 0xe29386719c155b6847ad5a4e97c6674f10ffc750. ETH and other tokens remain in reserve(token). The owner must setKeeper; that keeper configures the ETH/IMD v4 PoolKey with setImdPool and token/ETH routes with setEthPool before burnReserve can work. No route is assumed at deployment. burnReserve enforces minImdOut and sends bought IMD to BurnExecutor in the same transaction. ShiftRewards supports 0-730 day locks, unlocked withdrawals and stake/time-proportional multi-token rewards, including ETH and SHIFT. Splitter rewards and direct ETH receipts split half to a 7-day staker stream and half to the NIGHT FROGS pot for collection 0x55b8c762f1b86fe1d5406edaaae0f8ecf3688a0c. The owner posts bounded epoch/token roots; claims use the StandardMerkleTree double-hashed (epoch, account, token, amount) leaf once per wallet/epoch/token. Anyone can settleEpoch after 30 days to return unclaimed amounts to the pot. Owner-funded notifyRewardAmount streams exclusively to stakers over 1-365 days. Limits are 32 active locks per account and 16 reward tokens; stream time with no stakers is not redistributed. Ownable transferOwnership and renounceOwnership are inherited. No stake or earned-reward recovery function exists. Hook data is ignored, allowing empty hookData; local swap tests use a settlement harness, so live Universal Router and V4 Quoter integration is not established by those tests. The required initialPrice is recorded verbatim; the deployer derives the actual opening price from launch policy."
+}
