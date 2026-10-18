@@ -38,6 +38,8 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
     /// @notice Shortest and longest duration the owner may stream an outside reward over.
     uint256 public constant MIN_NOTIFY_DURATION = 1 days;
     uint256 public constant MAX_NOTIFY_DURATION = 365 days;
+    /// @notice IMD, registered as a reward token from the start next to ETH and SHIFT.
+    address public constant IMD = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
     uint256 private constant PRECISION = 1e18;
 
     // ---------------------------------------------------------------- types
@@ -74,7 +76,13 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
 
     address[] public rewardTokens;
     mapping(address => bool) public isRewardToken;
+    /// @notice The owner's `notifyRewardAmount` stream per token.
     mapping(address => RewardData) public rewardData;
+    /// @notice The 7-day stream of rewards received through the splitter (or plain ETH), kept apart from the
+    /// owner's stream so neither can reschedule the other.
+    mapping(address => RewardData) public feeStream;
+    /// @notice Staker half of a token received before the owner registered it; streamed on `addRewardToken`.
+    mapping(address => uint256) public unstreamed;
     mapping(address => mapping(address => uint256)) public userRewardPerTokenPaid;
     mapping(address => mapping(address => uint256)) public rewards;
 
@@ -96,6 +104,9 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
     event FrogsClaimed(uint256 indexed epoch, address indexed account, address indexed token, uint256 amount);
     event EpochSettled(uint256 indexed epoch, address indexed token, uint256 returnedToPot);
     event DistributorSet(address distributor);
+    event RewardTokenAdded(address indexed token);
+    event RewardHeld(address indexed token, uint256 amount);
+    event RewardPaymentFailed(address indexed account, address indexed token, uint256 amount);
 
     // ---------------------------------------------------------------- errors
 
@@ -127,6 +138,7 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
         shift = IERC20(shift_);
         _addRewardToken(ETH);
         _addRewardToken(shift_);
+        _addRewardToken(IMD);
     }
 
     /// @notice Names the FeeSplitter that forwards token rewards. Callable once, by the deployer (the hook).
@@ -166,12 +178,10 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
     }
 
     /// @notice Pays out everything earned across every reward token.
+    /// A token whose transfer fails is skipped and stays claimable, so one token cannot block the others.
     function getReward() external nonReentrant {
         _updateAll(msg.sender);
-        uint256 n = rewardTokens.length;
-        for (uint256 i = 0; i < n; i++) {
-            _payReward(msg.sender, rewardTokens[i]);
-        }
+        _payAll(msg.sender);
     }
 
     /// @notice Pays out what was earned in one reward token.
@@ -180,13 +190,31 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
         _payReward(msg.sender, token);
     }
 
-    /// @notice Withdraws all unlocked stake and pays every reward.
-    function exit() external nonReentrant {
-        _withdraw(withdrawable(msg.sender));
+    function _payAll(address account) internal {
         uint256 n = rewardTokens.length;
         for (uint256 i = 0; i < n; i++) {
-            _payReward(msg.sender, rewardTokens[i]);
+            address token = rewardTokens[i];
+            uint256 reward = rewards[account][token];
+            if (reward == 0) continue;
+            rewards[account][token] = 0;
+            accounted[token] -= reward;
+            if (_trySend(token, account, reward)) {
+                emit RewardPaid(account, token, reward);
+            } else {
+                rewards[account][token] = reward;
+                accounted[token] += reward;
+                emit RewardPaymentFailed(account, token, reward);
+            }
         }
+    }
+
+    /// @notice Withdraws all unlocked stake and pays every reward.
+    /// Nothing unlocked is not an error: the rewards are still paid.
+    function exit() external nonReentrant {
+        _updateAll(msg.sender);
+        uint256 amount = withdrawable(msg.sender);
+        if (amount > 0) _withdraw(amount);
+        _payAll(msg.sender);
     }
 
     function _withdraw(uint256 amount) internal {
@@ -260,16 +288,24 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
 
     // ---------------------------------------------------------------- rewards maths
 
+    /// @notice End of the owner's stream for `token`, capped at now.
     function lastTimeRewardApplicable(address token) public view returns (uint256) {
-        uint256 finish = rewardData[token].periodFinish;
-        return block.timestamp < finish ? block.timestamp : finish;
+        return _applicable(rewardData[token]);
     }
 
+    function _applicable(RewardData storage r) internal view returns (uint256) {
+        return block.timestamp < r.periodFinish ? block.timestamp : r.periodFinish;
+    }
+
+    function _rpt(RewardData storage r) internal view returns (uint256) {
+        uint256 applicable = _applicable(r);
+        if (totalSupply == 0 || applicable <= r.lastUpdateTime) return r.rewardPerTokenStored;
+        return r.rewardPerTokenStored + ((applicable - r.lastUpdateTime) * r.rewardRate) / totalSupply;
+    }
+
+    /// @notice Accumulated reward per staked token across both streams of `token`.
     function rewardPerToken(address token) public view returns (uint256) {
-        RewardData storage r = rewardData[token];
-        if (totalSupply == 0) return r.rewardPerTokenStored;
-        uint256 elapsed = lastTimeRewardApplicable(token) - r.lastUpdateTime;
-        return r.rewardPerTokenStored + (elapsed * r.rewardRate) / totalSupply;
+        return _rpt(rewardData[token]) + _rpt(feeStream[token]);
     }
 
     /// @notice Reward in `token` that `account` can claim now.
@@ -282,30 +318,52 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
         uint256 n = rewardTokens.length;
         for (uint256 i = 0; i < n; i++) {
             address token = rewardTokens[i];
-            RewardData storage r = rewardData[token];
-            r.rewardPerTokenStored = rewardPerToken(token);
-            r.lastUpdateTime = lastTimeRewardApplicable(token);
+            _updateStream(rewardData[token]);
+            _updateStream(feeStream[token]);
             if (account != address(0)) {
                 rewards[account][token] = earned(account, token);
-                userRewardPerTokenPaid[account][token] = r.rewardPerTokenStored;
+                userRewardPerTokenPaid[account][token] = rewardPerToken(token);
             }
         }
+    }
+
+    /// @dev Settles a stream's accumulator. While nobody is staked the clock is paused: the unstreamed part is
+    /// pushed forward so it is paid to whoever stakes next instead of being credited to nobody.
+    function _updateStream(RewardData storage r) internal {
+        if (totalSupply == 0) {
+            if (r.periodFinish > r.lastUpdateTime) {
+                r.periodFinish = block.timestamp + (r.periodFinish - r.lastUpdateTime);
+                r.lastUpdateTime = block.timestamp;
+            }
+            return;
+        }
+        r.rewardPerTokenStored = _rpt(r);
+        r.lastUpdateTime = _applicable(r);
     }
 
     function _addRewardToken(address token) internal {
         if (isRewardToken[token]) return;
         if (rewardTokens.length >= MAX_REWARD_TOKENS) revert TooManyRewardTokens();
+        _updateAll(address(0));
         isRewardToken[token] = true;
         rewardTokens.push(token);
+        emit RewardTokenAdded(token);
+    }
+
+    /// @notice Owner registers `token` as a reward token and starts streaming any staker share already held for it.
+    function addRewardToken(address token) external onlyOwner nonReentrant {
+        _addRewardToken(token);
+        uint256 held = unstreamed[token];
+        if (held > 0) {
+            unstreamed[token] = 0;
+            _notifyStakers(feeStream[token], token, held, STREAM_DURATION);
+        }
     }
 
     /// @dev Starts or tops up the staker stream of `token` with `amount` over `duration`.
-    function _notifyStakers(address token, uint256 amount, uint256 duration) internal {
-        _addRewardToken(token);
-        // Settle the global accumulator for this token before changing its rate.
-        RewardData storage r = rewardData[token];
-        r.rewardPerTokenStored = rewardPerToken(token);
-        r.lastUpdateTime = lastTimeRewardApplicable(token);
+    function _notifyStakers(RewardData storage r, address token, uint256 amount, uint256 duration) internal {
+        // Settle the accumulator of this stream before changing its rate.
+        _updateStream(r);
 
         uint256 scaled = amount * PRECISION;
         if (block.timestamp >= r.periodFinish) {
@@ -330,11 +388,15 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
 
     /// @notice Announces `token` the splitter just transferred in: everything above what is accounted for is a
     /// reward, half to stakers over 7 days and half to the frogs pot. For ETH the `receive` path does the same.
+    /// Only the owner can register a new reward token this way; for a token the owner has not registered the
+    /// staker half is held in `unstreamed` until `addRewardToken`, so nobody else can grow the reward list.
     function notifyReceived(address token) external nonReentrant {
-        if (msg.sender != distributor && msg.sender != owner()) revert NotDistributor();
+        bool isOwner = msg.sender == owner();
+        if (msg.sender != distributor && !isOwner) revert NotDistributor();
         if (token == ETH) revert ValueMismatch();
         uint256 received = IERC20(token).balanceOf(address(this)) - accounted[token];
         if (received == 0) revert NothingReceived();
+        if (isOwner) _addRewardToken(token);
         _split(token, received);
     }
 
@@ -344,7 +406,12 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
         accounted[token] += amount;
         frogsPot[token] += toFrogs;
         emit FrogsPotFunded(token, toFrogs);
-        _notifyStakers(token, toStakers, STREAM_DURATION);
+        if (isRewardToken[token]) {
+            _notifyStakers(feeStream[token], token, toStakers, STREAM_DURATION);
+        } else {
+            unstreamed[token] += toStakers;
+            emit RewardHeld(token, toStakers);
+        }
     }
 
     /// @notice Owner adds an outside reward for stakers only, streamed over `duration`. For ETH send it as value.
@@ -366,7 +433,8 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
             if (amount == 0) revert NothingReceived();
         }
         accounted[token] += amount;
-        _notifyStakers(token, amount, duration);
+        _addRewardToken(token);
+        _notifyStakers(rewardData[token], token, amount, duration);
     }
 
     // ---------------------------------------------------------------- NIGHT FROGS pot
@@ -421,6 +489,17 @@ contract ShiftRewards is Ownable, ReentrancyGuard {
     }
 
     // ---------------------------------------------------------------- transfers
+
+    /// @dev Like `_send` but reports failure instead of reverting.
+    function _trySend(address token, address to, uint256 amount) internal returns (bool) {
+        if (token == ETH) {
+            (bool ok,) = to.call{value: amount}("");
+            return ok;
+        }
+        if (token.code.length == 0) return false;
+        (bool success, bytes memory data) = token.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        return success && (data.length == 0 || (data.length == 32 && abi.decode(data, (bool))));
+    }
 
     function _send(address token, address to, uint256 amount) internal {
         if (token == ETH) {

@@ -112,7 +112,8 @@ One fixed rule for every token (ETH is `address(0)`): 40% to `ShiftRewards`, 20%
 ### ShiftRewards
 
 SHIFT staking with Synthetix `StakingRewards` style accounting over several reward tokens (ETH and
-SHIFT registered from the start, others added as they arrive, at most 16).
+SHIFT and IMD registered from the start; only the owner can register more, with
+`addRewardToken(token)`, `notifyReceived` or `notifyRewardAmount`; at most 16).
 
 - `stake(amount, lockDays)` with `lockDays` 0 to 730. Each locked stake is a separate lock
   (at most 32 unexpired per account; expired locks are pruned). `withdraw(amount)` only moves
@@ -130,14 +131,37 @@ SHIFT registered from the start, others added as they arrive, at most 16).
   `keccak256(bytes.concat(keccak256(abi.encode(epoch, account, token, amount))))`, once per account,
   epoch and token, and never beyond the epoch total. `settleEpoch(epoch, token)`: anyone, after 30
   days, returns what was not claimed to the pot.
+- A token the FeeSplitter forwards that the owner has not registered still gets its frogs half in the
+  pot; its staker half is held in `unstreamed(token)` and starts its 7-day stream when the owner calls
+  `addRewardToken(token)`. Nobody but the owner can grow the reward-token list.
+- Splitter income streams in `feeStream(token)`; the owner's `notifyRewardAmount` streams in
+  `rewardData(token)`. They are separate, so fee income or a 1 wei deposit never reschedules the
+  owner's stream. A splitter top-up restarts its own 7-day window (Synthetix behaviour).
+- While nobody is staked the streams' clocks are paused: what would have streamed is carried forward
+  and paid to the stakers that come next, so nothing is stranded.
+- `getReward()` and `exit()` skip a token whose transfer fails (event `RewardPaymentFailed`), leaving it
+  claimable; `exit()` with nothing unlocked still pays rewards.
 - `notifyRewardAmount(token, amount, duration)`: owner adds an outside reward for stakers only
   (pulled by `transferFrom`, or sent as `msg.value` for ETH), streamed over 1 to 365 days.
 - The owner cannot move staked SHIFT or earned rewards: there is no sweep or recover function, and
   `accounted(token)` tracks every liability so only true surplus is ever treated as a new reward.
 
+### Revision notes
+
+- Sells the pool cannot fill completely (price limit reached) revert with `PartialFill`, because the
+  fee is sized from the specified amount. The V4 Quoter already refuses such quotes.
+- Exact-output sells pay `shiftFeeBps` of everything the seller pays in SHIFT (grossed up), the same
+  rate as exact-input sells.
+- `setImdPool` / `setEthPool` accept only unhooked pools, and `burnReserve` requires `minImdOut > 0`.
+  The keeper still chooses fee tier and `minImdOut`: it is a trusted role appointed by the owner.
+- Trust assumption: the owner's `postRoot` decides who receives the NIGHT FROGS pot; nothing on
+  chain links a leaf to an NFT holder.
+- Design limit: the sell fee applies only on the hooked launch pool; other SHIFT pools (v2/v3/v4
+  without this hook) pay no hook fee, as the token itself is plain.
+
 ## Test coverage
 
-`forge test` runs 52 tests (4 suites) including fuzz tests. Run them with the verifier's seed:
+`forge test` runs 61 tests (4 suites) including fuzz tests. Run them with the verifier's seed:
 `FOUNDRY_FUZZ_SEED=0xe8f69d5a97069c4b71fa2bf1ed5665e21603e46101b3c8af05b66bb01fc141a5 forge test`.
 
 - Hook: flag/permission agreement, callbacks refuse non-manager callers, initialize refused for a

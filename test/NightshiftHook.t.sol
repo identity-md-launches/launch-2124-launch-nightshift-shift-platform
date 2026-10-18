@@ -250,6 +250,28 @@ contract NightshiftHookTest is Test {
         assertGt(d.amount1(), 0);
     }
 
+    function test_partialFillSellIsRefused() public {
+        // Tokens-only pool: after a 1 ETH buy the ETH side holds only that ETH, so a big sell cannot fill.
+        PoolManager pm = new PoolManager(address(this));
+        NightshiftHook fresh = _deployHook(pm, address(shift), address(this));
+        PoolKey memory k = key;
+        k.hooks = IHooks(address(fresh));
+        pm.initialize(k, SQRT_PRICE_1_1);
+        Swapper r = new Swapper(pm);
+        shift.transfer(address(r), 1_000_000e18);
+        r.addLiquidity(k, TickMath.minUsableTick(SPACING), -SPACING, 1e21);
+        vm.deal(address(r), 10 ether);
+        vm.prank(FIRST_BUYER, FIRST_BUYER);
+        r.swap(k, true, 1 ether);
+        vm.prank(alice, alice);
+        vm.expectRevert();
+        r.swapExact(k, false, -1_000e18);
+        vm.prank(alice, alice);
+        vm.expectRevert();
+        r.swapExact(k, false, 5 ether);
+        assertEq(shift.balanceOf(address(fresh.feeSplitter())), 0);
+    }
+
     function test_nobodyCanOpenOrCloseTradingOtherwise() public {
         vm.startPrank(OWNER);
         (bool ok,) = address(hook).call(abi.encodeWithSignature("openTrading()"));
@@ -310,7 +332,7 @@ contract NightshiftHookTest is Test {
         assertEq(ethFee, ethWanted * 250 / 9_750, "ETH fee is 2.5% of the gross output");
         uint256 shiftFee = shift.balanceOf(address(splitter));
         uint256 shiftPaid = uint256(uint128(-d.amount1()));
-        assertEq(shiftFee, (shiftPaid - shiftFee) * 250 / 10_000, "2.5% of the SHIFT the pool took");
+        assertApproxEqAbs(shiftFee, shiftPaid * 250 / 10_000, 1, "2.5% of everything the seller paid");
         assertGt(shiftFee, 0);
     }
 

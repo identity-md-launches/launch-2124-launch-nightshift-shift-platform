@@ -76,6 +76,7 @@ contract NightshiftHook is Ownable, IUnlockCallback {
     error TradingNotOpen();
     error FeeTooHigh();
     error NoClaims();
+    error PartialFill();
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -177,6 +178,10 @@ contract NightshiftHook is Ownable, IUnlockCallback {
 
         if (params.amountSpecified < 0) {
             // Exact input: the unspecified currency is ETH, the seller's output. Take the ETH part of the fee.
+            // The fee was sized from amountSpecified, so a sell the pool cannot fill completely is refused.
+            if (uint256(uint128(-delta.amount1())) + _tload() != uint256(-params.amountSpecified)) {
+                revert PartialFill();
+            }
             uint256 ethOut = uint256(uint128(delta.amount0()));
             uint256 ethFee = ethOut * ethFeeBps / BPS;
             _collectEth(ethFee);
@@ -185,8 +190,10 @@ contract NightshiftHook is Ownable, IUnlockCallback {
         }
 
         // Exact output: the unspecified currency is SHIFT, the seller's input. Charge the SHIFT part on top.
+        if (uint256(uint128(delta.amount0())) != uint256(params.amountSpecified) + _tload()) revert PartialFill();
+        // Grossed up so the fee is shiftFeeBps of everything the seller pays, as on exact-input sells.
         uint256 shiftIn = uint256(uint128(-delta.amount1()));
-        uint256 shiftFee = shiftIn * shiftFeeBps / BPS;
+        uint256 shiftFee = shiftIn * shiftFeeBps / (BPS - shiftFeeBps);
         if (shiftFee > 0) poolManager.take(key.currency1, address(feeSplitter), shiftFee);
         emit FeeTaken(tx.origin, shiftFee, _tload());
         return (IHooks.afterSwap.selector, shiftFee.toInt128());

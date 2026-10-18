@@ -146,19 +146,19 @@ contract FeeSplitterTest is Test {
         splitter.distribute(address(0));
         vm.prank(anyone);
         vm.expectRevert(FeeSplitter.NotKeeper.selector);
-        splitter.burnReserve(address(0), 1 ether, 0);
+        splitter.burnReserve(address(0), 1 ether, 1);
         vm.prank(OWNER);
         vm.expectRevert(FeeSplitter.NotKeeper.selector);
-        splitter.burnReserve(address(0), 1 ether, 0);
+        splitter.burnReserve(address(0), 1 ether, 1);
 
         vm.prank(OWNER);
         splitter.setKeeper(keeper);
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(FeeSplitter.RouteNotConfigured.selector, address(0)));
-        splitter.burnReserve(address(0), 1 ether, 0);
+        splitter.burnReserve(address(0), 1 ether, 1);
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(FeeSplitter.ExceedsReserve.selector, 3 ether, 2 ether));
-        splitter.burnReserve(address(0), 3 ether, 0);
+        splitter.burnReserve(address(0), 3 ether, 1);
     }
 
     function test_routeSettersValidate() public {
@@ -215,7 +215,7 @@ contract FeeSplitterTest is Test {
         splitter.setKeeper(anyone);
         vm.prank(keeper);
         vm.expectRevert(FeeSplitter.NotKeeper.selector);
-        splitter.burnReserve(address(0), 1 ether, 0);
+        splitter.burnReserve(address(0), 1 ether, 1);
     }
 
     function test_burnReserveEmitsImdBurned() public {
@@ -225,7 +225,7 @@ contract FeeSplitterTest is Test {
         vm.expectEmit(true, false, false, false, address(splitter));
         emit ImdBurned(address(0), 1 ether, 0);
         vm.prank(keeper);
-        splitter.burnReserve(address(0), 1 ether, 0);
+        splitter.burnReserve(address(0), 1 ether, 1);
     }
 
     function test_burnReserveTokenGoesThroughEth() public {
@@ -243,7 +243,7 @@ contract FeeSplitterTest is Test {
 
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(FeeSplitter.RouteNotConfigured.selector, address(other)));
-        splitter.burnReserve(address(other), 100e18, 0);
+        splitter.burnReserve(address(other), 100e18, 1);
         vm.prank(keeper);
         splitter.setEthPool(address(other), otherKey);
 

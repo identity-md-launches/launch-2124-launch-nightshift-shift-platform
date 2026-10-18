@@ -130,7 +130,7 @@ contract FeeSplitter is Ownable, ReentrancyGuard, IUnlockCallback {
     /// @notice Swaps `amountIn` of the `token` reserve to IMD on Uniswap v4 and sends all of it to the BurnExecutor.
     function burnReserve(address token, uint256 amountIn, uint256 minImdOut) external nonReentrant {
         if (msg.sender != keeper) revert NotKeeper();
-        if (amountIn == 0) revert ZeroAmount();
+        if (amountIn == 0 || minImdOut == 0) revert ZeroAmount();
         uint256 available = reserve[token];
         if (amountIn > available) revert ExceedsReserve(amountIn, available);
         if (!imdPoolSet) revert RouteNotConfigured(ETH);
@@ -196,6 +196,8 @@ contract FeeSplitter is Ownable, ReentrancyGuard, IUnlockCallback {
     function setImdPool(PoolKey calldata key) external {
         if (msg.sender != keeper) revert NotKeeper();
         if (Currency.unwrap(key.currency0) != ETH || Currency.unwrap(key.currency1) != IMD) revert BadRoute();
+        // Only unhooked pools, so a route cannot hand the reserve to a hook of the keeper's choosing.
+        if (address(key.hooks) != address(0)) revert BadRoute();
         imdPool = key;
         imdPoolSet = true;
         emit ImdPoolSet(key);
@@ -207,7 +209,7 @@ contract FeeSplitter is Ownable, ReentrancyGuard, IUnlockCallback {
         if (token == ETH) revert BadRoute();
         address c0 = Currency.unwrap(key.currency0);
         address c1 = Currency.unwrap(key.currency1);
-        if (c0 != ETH || c1 != token) revert BadRoute();
+        if (c0 != ETH || c1 != token || address(key.hooks) != address(0)) revert BadRoute();
         _ethPool[token] = key;
         ethPoolSet[token] = true;
         emit EthPoolSet(token, key);

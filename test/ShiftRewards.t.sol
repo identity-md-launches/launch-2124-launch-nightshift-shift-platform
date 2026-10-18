@@ -122,7 +122,7 @@ contract ShiftRewardsTest is Test {
         _fundEth(10 ether);
         assertEq(rewards.frogsPot(ETH), 5 ether);
         assertEq(rewards.accounted(ETH), 10 ether);
-        (uint256 periodFinish, uint256 rate,,) = rewards.rewardData(ETH);
+        (uint256 periodFinish, uint256 rate,,) = rewards.feeStream(ETH);
         assertEq(periodFinish, block.timestamp + 7 days);
         assertEq(rate, uint256(5 ether) * 1e18 / 7 days);
 
@@ -175,9 +175,18 @@ contract ShiftRewardsTest is Test {
         vm.expectRevert(ShiftRewards.NothingReceived.selector);
         rewards.notifyReceived(address(imd));
 
+        // The distributor cannot register a token: the staker half waits until the owner adds it.
         _fundToken(imd, 1000e18);
-        assertTrue(rewards.isRewardToken(address(imd)));
+        assertFalse(rewards.isRewardToken(address(imd)));
         assertEq(rewards.frogsPot(address(imd)), 500e18);
+        assertEq(rewards.unstreamed(address(imd)), 500e18);
+        vm.prank(alice);
+        vm.expectRevert();
+        rewards.addRewardToken(address(imd));
+        vm.prank(OWNER);
+        rewards.addRewardToken(address(imd));
+        assertTrue(rewards.isRewardToken(address(imd)));
+        assertEq(rewards.unstreamed(address(imd)), 0);
         vm.warp(block.timestamp + 7 days);
         vm.prank(alice);
         rewards.getReward(address(imd));
@@ -245,14 +254,21 @@ contract ShiftRewardsTest is Test {
     }
 
     function test_rewardTokenListIsBounded() public {
-        for (uint256 i = 0; i < 14; i++) {
+        // Junk from the distributor never grows the list.
+        for (uint256 i = 0; i < 20; i++) {
             MockERC20 t = new MockERC20("T", "T", 0);
             _fundToken(t, 1e18);
+        }
+        assertEq(rewards.rewardTokenCount(), 3);
+        for (uint256 i = 0; i < 13; i++) {
+            MockERC20 t = new MockERC20("T", "T", 0);
+            vm.prank(OWNER);
+            rewards.addRewardToken(address(t));
         }
         assertEq(rewards.rewardTokenCount(), 16);
         MockERC20 extra = new MockERC20("X", "X", 0);
         extra.mint(address(rewards), 1e18);
-        vm.prank(distributor);
+        vm.prank(OWNER);
         vm.expectRevert(ShiftRewards.TooManyRewardTokens.selector);
         rewards.notifyReceived(address(extra));
     }
@@ -364,5 +380,71 @@ contract ShiftRewardsTest is Test {
         assertApproxEqAbs(
             rewards.earned(alice, ETH) * stakeB, rewards.earned(bob, ETH) * stakeA, uint256(stakeA) * stakeB
         );
+    }
+
+    // ---------------------------------------------------------------- revision checks
+
+    function test_ownerStreamNotRescheduledBySplitterIncome() public {
+        vm.prank(alice);
+        rewards.stake(100e18, 0);
+        vm.deal(OWNER, 365 ether);
+        vm.prank(OWNER);
+        rewards.notifyRewardAmount{value: 365 ether}(ETH, 365 ether, 365 days);
+        (uint256 finish,,,) = rewards.rewardData(ETH);
+        (bool ok,) = address(rewards).call{value: 1}("");
+        assertTrue(ok);
+        (uint256 finishAfter,,,) = rewards.rewardData(ETH);
+        assertEq(finishAfter, finish);
+        vm.warp(block.timestamp + 7 days);
+        assertApproxEqRel(rewards.earned(alice, ETH), 7 ether, 1e12);
+    }
+
+    function test_streamWhileNobodyStakedGoesToFirstStaker() public {
+        _fundEth(10 ether);
+        vm.warp(block.timestamp + 8 days);
+        vm.prank(alice);
+        rewards.stake(100e18, 0);
+        vm.warp(block.timestamp + 7 days);
+        assertApproxEqRel(rewards.earned(alice, ETH), 5 ether, 1e12);
+        assertLe(rewards.earned(alice, ETH), 5 ether);
+    }
+
+    function test_exitWithEverythingLockedStillPaysRewards() public {
+        vm.prank(alice);
+        rewards.stake(100e18, 30);
+        _fundEth(10 ether);
+        vm.warp(block.timestamp + 1 days);
+        uint256 e = rewards.earned(alice, ETH);
+        assertGt(e, 0);
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        rewards.exit();
+        assertEq(alice.balance - before, e);
+        assertEq(rewards.balanceOf(alice), 100e18);
+    }
+
+    function test_failingRewardTokenDoesNotBlockBatch() public {
+        vm.prank(alice);
+        rewards.stake(100e18, 0);
+        BrokenToken bad = new BrokenToken();
+        vm.prank(OWNER);
+        rewards.addRewardToken(address(bad));
+        bad.mint(address(rewards), 1e18);
+        vm.prank(distributor);
+        rewards.notifyReceived(address(bad));
+        _fundEth(10 ether);
+        vm.warp(block.timestamp + 7 days);
+        uint256 owedBad = rewards.earned(alice, address(bad));
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        rewards.getReward();
+        assertApproxEqRel(alice.balance - before, 5 ether, 1e12);
+        assertEq(rewards.earned(alice, address(bad)), owedBad);
+    }
+}
+
+contract BrokenToken is MockERC20("B", "B", 0) {
+    function transfer(address, uint256) public pure override returns (bool) {
+        revert("no");
     }
 }
